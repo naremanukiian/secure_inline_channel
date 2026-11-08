@@ -20,6 +20,8 @@ log = logging.getLogger("sic.device")
 
 
 def load_psk(path: str) -> bytes:
+    # Read the pre-shared key from a file; strip trailing whitespace so a newline doesn't
+    # end up as part of the key when the file was created with e.g. `echo "key" > psk`
     with open(path, "rb") as f:
         psk = f.read().strip()
     if len(psk) < 16:
@@ -40,15 +42,20 @@ def run_queue(num: int, fn, stop: threading.Event, name: str) -> None:
         if out is None:
             pkt.drop()
         elif out is raw:
+            # Packet object is the same (not modified); tell netfilter to accept it as-is
             pkt.accept()
         else:
+            # Payload was transformed (encrypted or decrypted); update the packet and accept
             pkt.set_payload(out)
             pkt.accept()
 
     nfq = NetfilterQueue()
     nfq.bind(num, cb, max_len=8192)
+    # Wrap the netfilter file descriptor in a socket so we can apply a timeout and
+    # check the stop event periodically without blocking forever in nfq.run()
     s = socket.fromfd(nfq.get_fd(), socket.AF_UNIX, socket.SOCK_STREAM)
     try:
+        # Increase the kernel socket receive buffer to handle traffic bursts without drops
         s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 8 * 1024 * 1024)
     except OSError:
         pass
@@ -59,7 +66,7 @@ def run_queue(num: int, fn, stop: threading.Event, name: str) -> None:
             try:
                 nfq.run_socket(s)
             except socket.timeout:
-                continue
+                continue  # just loop back and check stop
     finally:
         nfq.unbind()
         s.close()
@@ -95,23 +102,28 @@ def main(argv=None) -> int:
         ap.error("--peer is required for the initiator")
 
     psk = load_psk(a.psk_file)
+    # Build the traffic policy; default to protecting all TCP between any two addresses
     policy = Policy(parse_ports(a.port), a.net_a or ["0.0.0.0/0"], a.net_b or ["0.0.0.0/0"])
     manager = crypto.SessionManager()
     stats = Stats()
     dp = Datapath(policy, manager, verify_checksums=not a.no_verify_checksums, stats=stats)
+    # Session kwargs passed to the handshake; rekey_packets*2 gives headroom for in-flight packets
     skw = dict(max_packets=a.rekey_packets * 2, fwd_window=a.fwd_window, back_window=a.back_window)
 
+    # A single threading.Event lets all threads shut down cleanly when we receive SIGINT/SIGTERM
     stop = threading.Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
     signal.signal(signal.SIGTERM, lambda *_: stop.set())
 
     threads = []
+    # One control-channel thread (initiator dials out; responder listens)
     if a.role == "initiator":
         threads.append(threading.Thread(target=handshake.initiator_loop, name="ctl", daemon=True, args=(
             manager, a.peer, a.control_port, psk, stop, a.rekey_seconds, a.rekey_packets), kwargs=skw))
     else:
         threads.append(threading.Thread(target=handshake.serve, name="ctl", daemon=True, args=(
             manager, a.listen, a.control_port, psk, stop), kwargs=skw))
+    # Two packet-processing threads: one for outbound (encrypt) and one for inbound (decrypt)
     threads.append(threading.Thread(target=run_queue, name="enc", daemon=True,
                                     args=(a.enc_queue, dp.outbound, stop, "encrypt")))
     threads.append(threading.Thread(target=run_queue, name="dec", daemon=True,
@@ -119,6 +131,7 @@ def main(argv=None) -> int:
     for t in threads:
         t.start()
 
+    # Main thread just prints stats periodically and waits for the stop event
     while not stop.wait(a.stats_interval if a.stats_interval > 0 else 3600):
         if a.stats_interval > 0:
             log.info("stats %s", dict(sorted(stats.snapshot().items())))

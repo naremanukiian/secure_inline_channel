@@ -8,6 +8,8 @@ import sys
 
 
 def blob(n: int, marker: bytes, seed: int) -> bytes:
+    # Generate a deterministic pseudo-random byte string of exactly n bytes.
+    # The marker is embedded repeatedly so a sniffer can search for it on the wire.
     rnd = random.Random(seed)
     out = bytearray()
     while len(out) < n:
@@ -23,6 +25,7 @@ def server(a):
     s.listen(1)
     print("server ready", flush=True)
     c, addr = s.accept()
+    # Read everything the client sends and compute a SHA-256 hash to verify integrity
     h, total = hashlib.sha256(), 0
     while True:
         d = c.recv(65536)
@@ -30,6 +33,7 @@ def server(a):
             break
         h.update(d)
         total += len(d)
+    # Send the hash and total byte count back so the client can check the uplink
     reply = blob(a.reply_size, marker, 2)
     c.sendall(b"%s %d\n" % (h.hexdigest().encode(), total) + reply)
     c.close()
@@ -38,19 +42,23 @@ def server(a):
 
 def client(a):
     marker = a.marker.encode()
+    # Generate the same deterministic data the server expects (seed=1 for client->server)
     data = blob(a.size, marker, 1)
     s = socket.create_connection((a.host, a.port), timeout=20)
     s.sendall(data)
-    s.shutdown(socket.SHUT_WR)
+    s.shutdown(socket.SHUT_WR)  # signal end-of-upload; server will now send its reply
     resp = bytearray()
     while True:
         d = s.recv(65536)
         if not d:
             break
         resp += d
+    # Parse the response: first line is "sha256hex bytecount\n", rest is the reply blob
     line, _, body = bytes(resp).partition(b"\n")
     digest, n = line.split()
+    # Verify uplink integrity: does the server's hash match what we sent?
     ok_up = digest.decode() == hashlib.sha256(data).hexdigest() and int(n) == len(data)
+    # Verify downlink integrity: does the reply body match the expected deterministic blob?
     ok_down = body == blob(a.reply_size, marker, 2)
     print(f"client->server integrity: {'OK' if ok_up else 'FAIL'} ({len(data)} bytes)")
     print(f"server->client integrity: {'OK' if ok_down else 'FAIL'} ({len(body)} bytes)")

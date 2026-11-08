@@ -10,9 +10,10 @@ from typing import Iterable
 
 from .packet import Ipv4Info
 
-PASS = "pass"
-PROTECT = "protect"
-DROP = "drop"
+# The three possible verdicts for a packet
+PASS = "pass"       # forward the packet untouched (not our business)
+PROTECT = "protect" # encrypt (outbound) or decrypt-and-verify (inbound)
+DROP = "drop"       # silently discard (e.g. fragments we cannot safely classify)
 
 
 def parse_ports(specs: Iterable[str]) -> frozenset[int]:
@@ -23,6 +24,7 @@ def parse_ports(specs: Iterable[str]) -> frozenset[int]:
             tok = tok.strip()
             if not tok or tok == "all":
                 continue
+            # Range syntax: lo:hi (inclusive on both ends)
             if ":" in tok:
                 lo, hi = (int(x) for x in tok.split(":", 1))
             else:
@@ -39,6 +41,7 @@ class Policy:
 
     def __init__(self, ports: Iterable[int] = (), net_a=("0.0.0.0/0",), net_b=("0.0.0.0/0",)):
         self.ports = frozenset(ports)
+        # Store networks as (network_address, netmask) integer pairs for fast matching
         self._a = [self._net(n) for n in net_a]
         self._b = [self._net(n) for n in net_b]
 
@@ -49,18 +52,24 @@ class Policy:
 
     @staticmethod
     def _in(nets, ip: int) -> bool:
+        # Check if the IP address belongs to any of the given networks
         return any((ip & mask) == net for net, mask in nets)
 
     def classify(self, info: Ipv4Info) -> str:
+        # Only TCP traffic can be protected; pass everything else (UDP, ICMP, etc.)
         if info.proto != 6:
             return PASS
         s = int.from_bytes(info.src, "big")
         d = int.from_bytes(info.dst, "big")
+        # Traffic is selected if the source/dest pair matches net_a <-> net_b in either direction
         if not ((self._in(self._a, s) and self._in(self._b, d)) or
                 (self._in(self._b, s) and self._in(self._a, d))):
             return PASS
+        # Drop fragments: later fragments have no TCP header, so we can't tell if they
+        # belong to a protected flow, and passing them in the clear would be a leak
         if info.is_fragment:
             return DROP          # cannot be classified/protected safely
+        # If a port list was specified, only protect traffic on those ports
         if self.ports and info.sport not in self.ports and info.dport not in self.ports:
             return PASS
         return PROTECT
